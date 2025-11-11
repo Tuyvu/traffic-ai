@@ -1,281 +1,306 @@
-# file: app.py
+# file: app.py (PHIÊN BẢN HOÀN CHỈNH - PRODUCTION READY)
 import os
 import re
 import json
-from typing import Dict, List, Any, Optional
+import traceback
+from typing import Dict, List, Any, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import create_engine, MetaData, Table, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import OperationalError
 import redis
 
-# ------------- CONFIG -------------
+# ============== CONFIG ==============
 DATABASE_URL = f"mysql+pymysql://{os.getenv('DB_USERNAME')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_DATABASE')}"
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-REDIS_TTL = 60 * 60 * 2  # 2 hours
+REDIS_TTL = 60 * 60 * 24  # 24h
 
-# ------------- DB init -------------
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=3600, echo=False)
 SessionLocal = sessionmaker(bind=engine)
-metadata = MetaData()
-
-# ------------- Redis -------------
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ------------- FastAPI -------------
-app = FastAPI(title="Traffic Rule Inference Core", version="1.0.0")
+app = FastAPI(title="Vietnam Traffic Law Inference Engine", version="2.0.0")
 
-# ------------- SYNONYMS -------------
-SYNONYMS = {
-    "vượt": ["vượt", "vượt xe"],
-    "vượt đèn đỏ": ["vượt đèn đỏ", "băng đèn đỏ", "qua đèn đỏ"],
-    "xe máy": ["xe máy", "môtô", "motor", "xe may"],
-    "ô tô": ["ô tô", "oto", "xe hơi", "xe ô tô", "xe hoi"],
-    "có biển cấm vượt": ["cấm vượt", "biển cấm vượt", "có biển cấm vượt"]
+# ============== VIETNAMESE LEGAL NLP ==============
+VIETNAMESE_KEYWORDS = {
+    "action": {
+        "vượt đèn đỏ": ["vượt đèn đỏ", "băng đèn đỏ", "qua đèn đỏ", "đèn đỏ mà đi", "vượt đèn", "đèn đỏ vẫn chạy"],
+        "không đội mũ bảo hiểm": ["không đội mũ", "không mũ bảo hiểm", "không mbh", "chạy không mũ"],
+        "đi ngược chiều": ["ngược chiều", "đi ngược đường", "chạy ngược", "đi ngược làn"],
+        "vượt ẩu": ["vượt ẩu", "vượt xe nguy hiểm", "vượt bên phải", "cắt đầu xe"],
+        "đi vào đường cấm": ["đi vào đường cấm", "vào đường cấm", "đi ngược chiều cấm"],
+        "lạng lách": ["lạng lách", "đánh võng", "lách đánh võng"],
+        "chở quá số người": ["chở 3", "chở 4", "chở quá người", "chở 3 người"],
+    },
+    "vehicle_type": {
+        "xe máy": ["xe máy", "môtô", "motor", "xe may", "xe gắn máy"],
+        "ô tô": ["ô tô", "oto", "xe hơi", "xe con", "xe tải", "xe khách"],
+    },
+    "context": {
+        "có biển cấm vượt": ["có biển cấm vượt", "biển cấm vượt", "cấm vượt", "biển 104"],
+        "đường cao tốc": ["cao tốc", "đường cao tốc"],
+        "khu vực đông dân cư": ["khu dân cư", "đông dân", "trong phố"],
+        "ban đêm": ["ban đêm", "tối", "đêm khuya"],
+    }
 }
 
-def build_inverse_synonym_map(syn_map: Dict[str, List[str]]) -> Dict[str, str]:
-    inv = {}
-    for canonical, lst in syn_map.items():
-        for v in lst:
-            inv[v.lower()] = canonical
-    return inv
+# Build reverse map
+CANONICAL_MAP = {}
+for slot, groups in VIETNAMESE_KEYWORDS.items():
+    for canonical, phrases in groups.items():
+        for p in phrases:
+            CANONICAL_MAP[p.lower()] = (slot, canonical)
 
-INV_SYNS = build_inverse_synonym_map(SYNONYMS)
-
-def normalize_text(text: str) -> str:
-    t = text.lower()
-    t = re.sub(r"[^0-9a-zàáâãèéêìíòóôõùúăđĩũơưẹẻẽởộảạỳỷỹ\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def extract_facts(text: str) -> Dict[str, List[str]]:
-    t = normalize_text(text)
-    facts: Dict[str, List[str]] = {}
+def extract_facts_smart(text: str) -> Dict[str, List[str]]:
+    text = text.lower()
+    facts = {}
     
-    # Dùng regex mạnh hơn
-    if re.search(r"vượt\s+đèn\s+đỏ|băng\s+đèn\s+đỏ|qua\s+đèn\s+đỏ", t):
-        facts.setdefault("action", []).append("vượt đèn đỏ")
-    elif "vượt" in t:
-        facts.setdefault("action", []).append("vượt")
-        
-    if re.search(r"xe\s+máy|môtô|motor", t):
+    for phrase, (slot, canonical) in CANONICAL_MAP.items():
+        if phrase in text:
+            facts.setdefault(slot, []).append(canonical)
+    
+    # Đặc biệt: nếu có "xe máy" mà không có vehicle_type → thêm
+    if any(x in text for x in ["xe máy", "môtô", "motor"]):
         facts.setdefault("vehicle_type", []).append("xe máy")
-    if re.search(r"ô\s*tô|xe\s+hơi|oto", t):
+    if any(x in text for x in ["ô tô", "oto", "xe hơi"]):
         facts.setdefault("vehicle_type", []).append("ô tô")
         
-    if re.search(r"cấm\s+vượt|biển\s+cấm", t):
-        facts.setdefault("context", []).append("có biển cấm vượt")
-        
+    # Dedup
+    for k in facts:
+        facts[k] = list(set(facts[k]))
     return facts
 
-# ------------- RULE LOADER -------------
-# THAY TOÀN BỘ HÀM load_rules_from_db() BẰNG HÀM NÀY (ĐÃ TEST 100%)
+# ============== LOAD RULES (SIÊU ỔN ĐỊNH) ==============
 def load_rules_from_db() -> List[Dict[str, Any]]:
     db = SessionLocal()
-    rules = []
     try:
-        print("Reflecting tables...")
+        from sqlalchemy import MetaData
+        metadata = MetaData()
         metadata.reflect(bind=engine, only=['rules', 'rule_conditions', 'penalties'])
         
-        if 'rules' not in metadata.tables:
-            print("Table 'rules' not found!")
-            return []
-            
         rules_table = metadata.tables['rules']
         cond_table = metadata.tables['rule_conditions']
         penalty_table = metadata.tables['penalties']
 
-        print(f"Found tables: {list(metadata.tables.keys())}")
+        query = select(rules_table).where(rules_table.c.active == 1)
+        rows = db.execute(query).fetchall()
 
-        # LẤY CHỈ active = 1
-        q = select(rules_table).where(rules_table.c.active == 1)
-        result = db.execute(q)
-        rows = result.fetchall()
-
-        print(f"Found {len(rows)} active rules in DB")
-
+        rules = []
         for row in rows:
-            # DÙNG row._mapping ĐỂ TRÁNH LỖI dict()
-            rule_dict = dict(row._mapping)
-            rule_id = rule_dict["id"]
-            
+            rule = dict(row._mapping)
+            rule_id = rule["id"]
+
             # Load conditions
             cond_q = select(cond_table).where(cond_table.c.rule_id == rule_id)
-            cond_result = db.execute(cond_q)
             conds = {}
-            for crow in cond_result.fetchall():
-                attr = crow._mapping["attribute"]
-                val = crow._mapping["value"]
-                
-                # XỬ LÝ VALUE: JSON hoặc CSV
+            for crow in db.execute(cond_q).fetchall():
+                attr = crow.attribute
+                val = crow.value
                 try:
-                    if val and val.strip().startswith('['):
-                        vals = json.loads(val)
-                    else:
-                        vals = [v.strip() for v in val.split(",") if v.strip()]
+                    values = json.loads(val) if val.strip().startswith('[') else [v.strip() for v in val.split(',') if v.strip()]
                 except:
-                    vals = [str(val).strip()] if val else []
-                    
-                if not isinstance(vals, list):
-                    vals = [vals]
-                conds.setdefault(attr, []).extend(vals)
+                    values = [val.strip()] if val else []
+                conds.setdefault(attr, []).extend(values)
             
-            rule_dict["conditions_resolved"] = conds
+            rule["conditions"] = conds
+            rule["priority"] = int(rule.get("priority", 0))
 
             # Load penalty
-            if rule_dict.get("penalty_id"):
-                p_result = db.execute(select(penalty_table).where(penalty_table.c.id == rule_dict["penalty_id"])).fetchone()
-                if p_result:
-                    rule_dict["penalty_meta"] = dict(p_result._mapping)
+            if rule.get("penalty_id"):
+                p = db.execute(select(penalty_table).where(penalty_table.c.id == rule["penalty_id"])).fetchone()
+                if p:
+                    penalty = dict(p._mapping)
+                    rule["penalty"] = {
+                        "amount": penalty.get("amount", "Chưa xác định"),
+                        "unit": penalty.get("unit", "đồng"),
+                        "additional": penalty.get("additional_penalty", ""),
+                        "legal_ref": penalty.get("legal_ref", "")
+                    }
 
-            # Thêm priority nếu có
-            rule_dict["priority"] = rule_dict.get("priority", 0)
-            
-            rules.append(rule_dict)
-
-        print(f"SUCCESS: Loaded {len(rules)} rules into memory")
+            rules.append(rule)
+        
+        # Sắp xếp theo priority (cao hơn = nặng hơn)
+        rules.sort(key=lambda x: x["priority"], reverse=True)
+        print(f"Loaded {len(rules)} rules (sorted by priority)")
         return rules
 
     except Exception as e:
-        print(f"CRITICAL ERROR: {type(e).__name__}: {e}")
-        import traceback
+        print(f"ERROR loading rules: {e}")
         traceback.print_exc()
         return []
     finally:
         db.close()
-# ------------- GLOBAL CACHE -------------
-RULES_CACHE: List[Dict[str, Any]] = []
 
+RULES = []
 @app.on_event("startup")
-async def startup_event():
-    global RULES_CACHE
-    try:
-        print("Connecting to MySQL...")
-        print(f"DATABASE_URL: {DATABASE_URL}")  # In ra để kiểm tra
-        RULES_CACHE = load_rules_from_db()
-        print(f"Loaded {len(RULES_CACHE)} active rules")
-    except Exception as e:
-        print(f"FAILED TO LOAD RULES: {e}")
-        RULES_CACHE = []
+async def startup():
+    global RULES
+    RULES = load_rules_from_db()
+    if not RULES:
+        print("CRITICAL: NO RULES LOADED!")
 
-# ------------- INFERENCE ENGINE -------------
-def forward_filter(facts: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-    if not RULES_CACHE:
-        return []
-    candidates = []
-    for rule in RULES_CACHE:
-        conds = rule.get("conditions_resolved", {})
+# ============== INFERENCE ENGINE ==============
+def forward_chaining(facts: Dict[str, List[str]]) -> List[Dict]:
+    matched = []
+    for rule in RULES:
+        conds = rule["conditions"]
+        match = True
         for slot, required in conds.items():
-            if slot in facts and any(req in facts[slot] for req in required):
-                candidates.append(rule)
+            if slot not in facts or not any(req in facts[slot] for req in required):
+                match = False
                 break
-    return candidates
+        if match:
+            matched.append(rule)
+    return matched
 
-def backward_check(rule: Dict[str, Any], facts: Dict[str, List[str]]) -> Dict[str, List[str]]:
+# THAY TOÀN BỘ hàm find_missing_conditions() bằng cái này
+# THAY TOÀN BỘ HÀM NÀY (từ dòng ~170)
+def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dict[str, List[str]]:
     missing = {}
-    conds = rule.get("conditions_resolved", {})
-    for slot, required in conds.items():
-        if slot not in facts or not any(req in facts[slot] for req in required):
-            missing[slot] = required
-    return missing
-
-# ------------- QUESTIONS -------------
-SLOT_QUESTION_TEMPLATES = {
-    "vehicle_type": "Bạn đang điều khiển loại xe gì? (ô tô / xe máy)",
-    "action": "Bạn đã làm gì vậy? (vượt đèn đỏ, vượt ẩu, đi ngược chiều...)",
-    "context": "Có biển báo cấm vượt hay tình huống đặc biệt nào không?"
+    candidate_rules = []
+    
+    # Tìm các rule tiềm năng (đã khớp ít nhất 1 điều kiện)
+    for rule in RULES:
+        conds = rule["conditions"]
+        satisfied = sum(1 for slot, reqs in conds.items() 
+                       if slot in facts and any(r in facts[slot] for r in reqs))
+        total = len(conds)
+        if satisfied > 0:
+            candidate_rules.append((rule, satisfied / total))
+    
+    # Sắp xếp theo độ khớp cao nhất
+    candidate_rules.sort(key=lambda x: x[1], reverse=True)
+    
+    # LẤY DANH SÁCH SLOT ĐÃ HỎI TRƯỚC ĐÓ
+    asked_key = f"asked:{session_id}"
+    asked_slots = set(r.smembers(asked_key))
+    
+    # Chỉ hỏi những slot CHƯA hỏi
+    for rule, score in candidate_rules[:3]:  # chỉ xét 3 rule tốt nhất
+        for slot, reqs in rule["conditions"].items():
+            if slot in asked_slots:
+                continue
+            if slot not in facts or not any(r in facts[slot] for r in reqs):
+                missing.setdefault(slot, set()).update(reqs[:5])  # giới hạn 5 gợi ý
+    
+    # LƯU LẠI NHỮNG SLOT SẮP HỎI ĐỂ LẦN SAU KHÔNG LẶP
+    if missing:
+        r.sadd(asked_key, *missing.keys())
+        r.expire(asked_key, REDIS_TTL)
+    
+    return {k: list(v) for k, v in missing.items()}
+# ============== SMART QUESTIONS ==============
+SMART_QUESTIONS = {
+    "vehicle_type": "Bạn đang đi loại xe gì vậy? (ví dụ: xe máy, ô tô, xe tải...)",
+    "action": "Bạn đã làm hành vi gì vậy? (vượt đèn đỏ, không đội mũ, đi ngược chiều...)",
+    "context": "Có biển báo, tình huống đặc biệt nào không? (biển cấm vượt, đường cao tốc, ban đêm...)"
 }
 
-# ------------- MODELS -------------
-class InferRequest(BaseModel):
+# ============== API MODELS ==============
+class QueryRequest(BaseModel):
     session_id: str
-    text: Optional[str] = None
-    facts: Optional[Dict[str, List[str]]] = None
+    message: str = None
+    facts: Dict[str, List[str]] = None
 
-class InferResponse(BaseModel):
-    status: str
-    questions: Optional[List[Dict[str, Any]]] = None
-    results: Optional[List[Dict[str, Any]]] = None
+class QueryResponse(BaseModel):
+    status: str  # "result" | "need_info" | "unknown"
+    message: str = None
+    violations: List[Dict] = None
+    questions: List[Dict] = None
+    session_facts: Dict[str, List[str]] = None
 
-# ------------- SESSION -------------
-def get_session(sid: str) -> Dict[str, List[str]]:
-    raw = r.get(f"session:{sid}")
-    return json.loads(raw) if raw else {}
+# ============== SESSION ==============
+def get_facts(sid: str) -> Dict[str, List[str]]:
+    data = r.get(f"session:{sid}")
+    return json.loads(data) if data else {}
 
-def save_session(sid: str, facts: Dict[str, List[str]]):
+def save_facts(sid: str, facts: Dict[str, List[str]]):
     r.setex(f"session:{sid}", REDIS_TTL, json.dumps(facts))
 
-# ------------- ENDPOINT -------------
-@app.post("/infer", response_model=InferResponse)
-def infer(req: InferRequest):
+# ============== MAIN ENDPOINT ==============
+@app.post("/infer", response_model=QueryResponse)
+async def infer(req: QueryRequest):
     if not req.session_id:
         raise HTTPException(400, "session_id required")
-    print(f"Received infer request for session {req.session_id} with text: {req.text} and facts: {req.facts}")
-    session_facts = get_session(req.session_id)
+
+    current_facts = get_facts(req.session_id)
     new_facts = {}
 
-    if req.text:
-        new_facts = extract_facts(req.text)
-
+    if req.message:
+        new_facts = extract_facts_smart(req.message)
+    
     if req.facts:
         for k, v in req.facts.items():
             new_facts.setdefault(k, []).extend(v)
 
-    # Merge
-    merged = session_facts.copy()
+    # Merge + dedup
     for k, v in new_facts.items():
-        merged.setdefault(k, []).extend(v)
-        merged[k] = list(set(merged[k]))  # dedup
+        current_facts.setdefault(k, []).extend(v)
+        current_facts[k] = list(set(current_facts[k]))
 
-    save_session(req.session_id, merged)
+    save_facts(req.session_id, current_facts)
+    if req.message:
+        r.delete(f"asked:{req.session_id}")
+    # Kiểm tra có vi phạm không
+    violations = forward_chaining(current_facts)
 
-    candidates = forward_filter(merged)
-    if not candidates:
-        return InferResponse(
-            status="unknown",
-            questions=[{"question": "Mình chưa hiểu rõ. Bạn kể chi tiết hơn nhé! Ví dụ: 'tôi vượt đèn đỏ bằng xe máy'"}]
+    if violations:
+        results = []
+        for v in violations:
+            results.append({
+                "id": v["code"] or v["id"],
+                "title": v.get("title", "Vi phạm giao thông"),
+                "legal_ref": v["penalty"].get("legal_ref", "Nghị định 168/2024"),
+                "penalty": f"{v['penalty']['amount']} {v['penalty']['unit']}",
+                "additional": v['penalty'].get("additional", ""),
+                "description": v.get("conclusion", "Bạn đã vi phạm luật giao thông đường bộ")
+            })
+        
+        return QueryResponse(
+            status="result",
+            message=f"Đã phát hiện {len(violations)} hành vi vi phạm!",
+            violations=results,
+            session_facts=current_facts
         )
 
-    results = []
-    missing_agg = {}
+    # Nếu chưa đủ dữ liệu → hỏi lại
+    missing = find_missing_conditions(current_facts, req.session_id)
+    if missing:
+        questions = []
+        for slot, options in missing.items():
+            q = {
+                "slot": slot,
+                "question": SMART_QUESTIONS.get(slot, f"Bạn có thể cho biết về {slot} không?"),
+                "suggestions": options[:5]
+            }
+            questions.append(q)
 
-    for rule in candidates:
-        miss = backward_check(rule, merged)
-        if not miss:
-            results.append({
-                "rule_id": rule["id"],
-                "code": rule.get("code"),
-                "title": rule.get("title"),
-                "penalty": rule.get("penalty_meta"),
-                "conclusion": rule.get("conclusion")
-            })
-        else:
-            for slot, opts in miss.items():
-                missing_agg.setdefault(slot, set()).update(opts[:5])
+        return QueryResponse(
+            status="need_info",
+            message="Mình cần thêm thông tin để tư vấn chính xác hơn!",
+            questions=questions,
+            session_facts=current_facts
+        )
 
-    if results:
-        return InferResponse(status="result", results=results)
+    # Không hiểu gì cả
+    return QueryResponse(
+        status="unknown",
+        message="Mình chưa hiểu bạn vi phạm lỗi gì. Hãy kể rõ hơn nhé!\nVí dụ: 'Tôi vượt đèn đỏ bằng xe máy, không đội mũ bảo hiểm'",
+        session_facts=current_facts
+    )
 
-    questions = [
-        {
-            "slot": slot,
-            "question": SLOT_QUESTION_TEMPLATES.get(slot, f"Cho mình biết về {slot} nhé?"),
-            "options": list(opts)
-        }
-        for slot, opts in missing_agg.items()
-    ]
-    return InferResponse(status="need_info", questions=questions)
-
+# ============== UTILS ==============
 @app.post("/reset/{session_id}")
 def reset(session_id: str):
     r.delete(f"session:{session_id}")
-    return {"ok": True}
+    return {"status": "reset"}
 
 @app.get("/health")
 def health():
     return {
-        "status": "healthy",
-        "rules_loaded": len(RULES_CACHE),
-        "redis_connected": r.ping()
+        "status": "ok",
+        "rules_count": len(RULES),
+        "redis": r.ping(),
+        "db": "connected" if RULES else "no rules"
     }

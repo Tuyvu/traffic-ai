@@ -2,6 +2,7 @@
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tư vấn Vi phạm Giao thông - AI Luật</title>
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
@@ -47,14 +48,14 @@
                 </div>
 
                 <!-- Pending Question -->
-                <div x-show="currentQuestion" x-cloak class="bg-yellow-50 border-t-4 border-yellow-400 p-4">
+                <div x-show="currentQuestion && currentQuestion.question" x-cloak class="bg-yellow-50 border-t-4 border-yellow-400 p-4">
                     <p class="font-semibold text-yellow-800">Hệ thống cần hỏi thêm:</p>
                     <p class="mt-2 text-lg" x-text="currentQuestion.question"></p>
-                    <div class="mt-3 flex flex-wrap gap-3">
-                        <template x-for="option in currentQuestion.options">
+                    <div class="mt-3 flex flex-wrap gap-3" x-show="currentQuestion.options.length > 0">
+                        <template x-for="option in currentQuestion.options" :key="option">
                             <button @click="answerQuestion(option)"
                                 class="px-4 py-2 bg-white border border-yellow-400 rounded-lg hover:bg-yellow-100 transition">
-                                x-text="option"
+                                <span x-text="option"></span>
                             </button>
                         </template>
                     </div>
@@ -183,7 +184,7 @@ function trafficChat() {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-CSRF-156TOKEN': '{{ csrf_token() }}'
+                    'X-CSRF-TOKEN': '{{ csrf_token() }}'
                 },
                 body: JSON.stringify({
                     answer: option,
@@ -200,42 +201,48 @@ function trafficChat() {
         },
 
         handleResponse(data) {
-            if (data.error) {
-                this.addMessage('Error: ' + data.error);
-                return;
-            }
+    if (data.error) {
+        this.addMessage('Error: ' + data.error);
+        return;
+    }
 
-            // Cập nhật facts
-            if (data.facts) {
-                this.facts = { ...this.facts, ...data.facts };
-            }
+    // CẬP NHẬT FACTS
+    if (data.facts) {
+        this.facts = { ...this.facts, ...data.facts };
+    }
 
-            if (data.status === 'need_info' && data.questions && data.questions.length > 0) {
-                const q = data.questions[0];
-                this.currentQuestion = {
-                    slot: q.slot,
-                    question: q.question,
-                    options: q.options || []
-                };
-                this.addMessage(q.question);
-            }
+    // RESET currentQuestion VỀ OBJECT RỖNG (KHÔNG PHẢI null)
+    this.currentQuestion = { question: '', options: [], slot: '' };
 
-            if (data.status === 'result' && data.results) {
-                this.finalResult = data.results;
-                this.currentQuestion = null;
-                data.results.forEach(r => {
-                    this.addMessage(`
-                        Bạn đã vi phạm: ${r.title}
-                        Mức phạt: ${r.penalty?.fine || 'Chưa xác định'}
-                        Căn cứ: ${r.code}
-                    `);
-                });
-            }
+    if (data.status === 'need_info' && data.questions && data.questions.length > 0) {
+        const q = data.questions[0];
+        this.currentQuestion = {
+            slot: q.slot || '',
+            question: q.question || 'Bạn có thể nói rõ hơn không?',
+            options: Array.isArray(q.options) ? q.options : []
+        };
+        this.addMessage(this.currentQuestion.question);
+    }
 
-            if (data.status === 'unknown') {
-                this.addMessage(data.questions[0].question);
-            }
-        },
+    if (data.status === 'result' && data.results && data.results.length > 0) {
+        this.finalResult = data.results;
+        this.currentQuestion = { question: '', options: [], slot: '' }; // reset
+        data.results.forEach(r => {
+            const fine = r.penalty?.fine || 'Chưa xác định';
+            const code = r.code || 'Nghị định 100/2019';
+            this.addMessage(`
+                <strong class="text-lg">${r.title}</strong><br>
+                <span class="text-2xl font-bold text-red-600">Phạt: ${fine} VNĐ</span><br>
+                <span class="text-sm text-gray-600">${r.conclusion || ''}</span><br>
+                <span class="text-xs text-gray-500">Căn cứ: ${code}</span>
+            `);
+        });
+    }
+
+    if (data.status === 'unknown') {
+        this.addMessage(data.questions?.[0]?.question || "Mình chưa hiểu rõ. Bạn mô tả lại nhé!");
+    }
+},
 
         resetChat() {
             if (!confirm('Xóa toàn bộ cuộc trò chuyện?')) return;
