@@ -7,7 +7,7 @@ use App\Http\Controllers\Admin\RuleController;
 
 Route::get('/chat', [InferenceRuleController::class, 'index'])->name('inference.show');
 Route::post('/chat/infer', [InferenceRuleController::class, 'infer'])->name('inference.infer');
-Route::post('/chat/reset', [InferenceRuleController::class, 'infer'])->name('inference.reset');
+Route::post('/chat/reset', [InferenceRuleController::class, 'reset'])->name('inference.reset');
 Route::resource('rules', RuleController::class);
 // Route để xử lý logic khi form được gửi
 // [cite: 19, 50, 56]

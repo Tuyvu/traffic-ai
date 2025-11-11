@@ -61,10 +61,10 @@ def extract_facts_smart(text: str) -> Dict[str, List[str]]:
             facts.setdefault(slot, []).append(canonical)
     
     # Đặc biệt: nếu có "xe máy" mà không có vehicle_type → thêm
-    if any(x in text for x in ["xe máy", "môtô", "motor"]):
-        facts.setdefault("vehicle_type", []).append("xe máy")
-    if any(x in text for x in ["ô tô", "oto", "xe hơi"]):
-        facts.setdefault("vehicle_type", []).append("ô tô")
+    # if any(x in text for x in ["xe máy", "môtô", "motor"]):
+    #     facts.setdefault("vehicle_type", []).append("xe máy")
+    # if any(x in text for x in ["ô tô", "oto", "xe hơi"]):
+    #     facts.setdefault("vehicle_type", []).append("ô tô")
         
     # Dedup
     for k in facts:
@@ -109,13 +109,16 @@ def load_rules_from_db() -> List[Dict[str, Any]]:
             # Load penalty
             if rule.get("penalty_id"):
                 p = db.execute(select(penalty_table).where(penalty_table.c.id == rule["penalty_id"])).fetchone()
+                print(f"Loading penalty for rule {rule_id}: {p}")
                 if p:
                     penalty = dict(p._mapping)
+                    fine_min = int(float(penalty.get("fine_min", 0))) if penalty.get("fine_min") else 0
+                    fine_max = int(float(penalty.get("fine_max", 0))) if penalty.get("fine_max") else 0
                     rule["penalty"] = {
-                        "amount": penalty.get("amount", "Chưa xác định"),
+                        "amount": f"{fine_min:,}-{fine_max:,}" if fine_min and fine_max else f"{fine_max or fine_min:,}",
                         "unit": penalty.get("unit", "đồng"),
-                        "additional": penalty.get("additional_penalty", ""),
-                        "legal_ref": penalty.get("legal_ref", "")
+                        "additional": penalty.get("additional_punishment", ""),
+                        "legal_ref": penalty.get("law_ref", "")
                     }
 
             rules.append(rule)
@@ -192,17 +195,29 @@ def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dic
     return {k: list(v) for k, v in missing.items()}
 # ============== SMART QUESTIONS ==============
 SMART_QUESTIONS = {
-    "vehicle_type": "Bạn đang đi loại xe gì vậy? (ví dụ: xe máy, ô tô, xe tải...)",
-    "action": "Bạn đã làm hành vi gì vậy? (vượt đèn đỏ, không đội mũ, đi ngược chiều...)",
-    "context": "Có biển báo, tình huống đặc biệt nào không? (biển cấm vượt, đường cao tốc, ban đêm...)"
+    "vehicle_type": {
+        "question": "Bạn đang điều khiển loại xe nào?",
+        "options": ["xe máy", "ô tô", "xe tải", "xe khách", "xe đạp"]
+    },
+    "action": {
+        "question": "Bạn đã làm hành vi gì?",
+        "options": ["vượt đèn đỏ", "không đội mũ bảo hiểm", "đi ngược chiều", "vượt ẩu", "lạng lách", "chở quá người"]
+    },
+    "context": {
+        "question": "Có tình huống đặc biệt nào không?",
+        "options": ["có biển cấm vượt", "đường cao tốc", "ban đêm", "khu dân cư đông", "không có gì đặc biệt"]
+    }
 }
 
 # ============== API MODELS ==============
 class QueryRequest(BaseModel):
     session_id: str
-    message: str = None
-    facts: Dict[str, List[str]] = None
+    message: Optional[str] = None
+    text: Optional[str] = None  # THÊM DÒNG NÀY
+    facts: Optional[Dict[str, List[str]]] = None
 
+    def get_input_text(self) -> Optional[str]:
+        return self.message or self.text
 class QueryResponse(BaseModel):
     status: str  # "result" | "need_info" | "unknown"
     message: str = None
@@ -221,15 +236,19 @@ def save_facts(sid: str, facts: Dict[str, List[str]]):
 # ============== MAIN ENDPOINT ==============
 @app.post("/infer", response_model=QueryResponse)
 async def infer(req: QueryRequest):
+    if req.message and any(req.message.lower().startswith(x) for x in ["tôi", "em", "mình", "tớ"]):
+        current_facts = {}  # coi như mô tả mới hoàn toàn
+        r.delete(f"asked:{req.session_id}")
     if not req.session_id:
         raise HTTPException(400, "session_id required")
-
+    print(f"[INFER] session={req.session_id} message={req.message} text={req.text} facts={req.facts}")
     current_facts = get_facts(req.session_id)
     new_facts = {}
 
-    if req.message:
-        new_facts = extract_facts_smart(req.message)
-    
+    input_text = req.get_input_text()
+    if input_text:
+        new_facts = extract_facts_smart(input_text)
+    print(f"Extracted facts from text: {new_facts}")
     if req.facts:
         for k, v in req.facts.items():
             new_facts.setdefault(k, []).extend(v)
@@ -239,11 +258,14 @@ async def infer(req: QueryRequest):
         current_facts.setdefault(k, []).extend(v)
         current_facts[k] = list(set(current_facts[k]))
 
+    print(f"Current facts: {current_facts}")
     save_facts(req.session_id, current_facts)
     if req.message:
         r.delete(f"asked:{req.session_id}")
     # Kiểm tra có vi phạm không
     violations = forward_chaining(current_facts)
+    for v in violations:
+        print(f"Matched rule: {v['id']} with priority {v.get('priority')}")
 
     if violations:
         results = []
@@ -268,17 +290,20 @@ async def infer(req: QueryRequest):
     missing = find_missing_conditions(current_facts, req.session_id)
     if missing:
         questions = []
-        for slot, options in missing.items():
-            q = {
+        for slot in missing.keys():
+            template = SMART_QUESTIONS.get(slot, {
+                "question": f"Cho mình biết về {slot} nhé?",
+                "options": missing[slot][:5]
+            })
+            questions.append({
                 "slot": slot,
-                "question": SMART_QUESTIONS.get(slot, f"Bạn có thể cho biết về {slot} không?"),
-                "suggestions": options[:5]
-            }
-            questions.append(q)
-
+                "question": template["question"],
+                "options": template["options"]
+            })
+        print(questions, current_facts)
         return QueryResponse(
             status="need_info",
-            message="Mình cần thêm thông tin để tư vấn chính xác hơn!",
+            message="Mình cần thêm thông tin để tư vấn chính xác!",
             questions=questions,
             session_facts=current_facts
         )

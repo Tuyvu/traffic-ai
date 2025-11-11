@@ -2,109 +2,97 @@
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
-    <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tư vấn Vi phạm Giao thông - AI Luật</title>
+    <title>Tư vấn Vi phạm Giao thông AI</title>
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        [x-cloak] { display: none !important; }
-    </style>
 </head>
-<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+<body class="bg-gradient-to-br from-slate-50 to-slate-100 min-h-screen">
 
-<div class="container mx-auto p-4 max-w-7xl" x-data="trafficChat()" x-init="init()">
-    
-    <div class="bg-white rounded-3xl shadow-2xl overflow-hidden">
-        <div class="bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-6">
-            <h1 class="text-2xl font-bold text-center">Tư vấn Vi phạm Giao thông Thông minh</h1>
-            <p class="text-center mt-2 opacity-90">Mô tả hành vi → Nhận kết quả phạt ngay lập tức!</p>
-        </div>
+<div class="max-w-6xl mx-auto p-6" x-data="trafficBot()" x-init="init()">
+    <div class="grid grid-cols-12 gap-6">
 
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-0">
-            <!-- Chat Area -->
-            <div class="lg:col-span-2 flex flex-col h-[680px]">
-                <div class="flex-1 overflow-y-auto p-6 space-y-4" id="chatContainer">
-                    <template x-if="messages.length === 0">
-                        <div class="text-center text-gray-500 mt-20">
-                            <p class="text-lg">Xin chào! Hãy mô tả hành vi của bạn nhé</p>
-                            <p class="text-sm mt-2">Ví dụ: "Tôi đi xe máy vượt đèn đỏ ở ngã tư có biển cấm"</p>
-                        </div>
-                    </template>
+        <!-- CHAT TRÁI -->
+        <div class="col-span-8">
+            <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+                <div class="bg-gradient-to-r from-indigo-600 to-purple-600 p-5 text-white">
+                    <h1 class="text-2xl font-bold text-center">Tư vấn Vi phạm Giao thông AI</h1>
+                </div>
 
+                <div class="h-96 overflow-y-auto p-5 space-y-4" id="chatBox">
                     <template x-for="msg in messages" :key="msg.id">
                         <div class="flex" :class="msg.role === 'user' ? 'justify-end' : 'justify-start'">
                             <div :class="msg.role === 'user' 
                                 ? 'bg-indigo-600 text-white' 
                                 : 'bg-gray-100 text-gray-800'"
-                                class="max-w-xs lg:max-w-md px-4 py-3 rounded-2xl shadow">
-                                <p x-text="msg.content"></p>
-                                <span class="text-xs opacity-70 block mt-1 text-right">
-                                    x-text="msg.time"
-                                </span>
+                                class="max-w-lg px-5 py-3 rounded-2xl shadow-md">
+                                <div x-html="msg.content"></div>
+                                <div class="text-xs opacity-70 mt-1" x-text="msg.time"></div>
                             </div>
                         </div>
                     </template>
                 </div>
 
-                <!-- Pending Question -->
-                <div x-show="currentQuestion && currentQuestion.question" x-cloak class="bg-yellow-50 border-t-4 border-yellow-400 p-4">
-                    <p class="font-semibold text-yellow-800">Hệ thống cần hỏi thêm:</p>
-                    <p class="mt-2 text-lg" x-text="currentQuestion.question"></p>
-                    <div class="mt-3 flex flex-wrap gap-3" x-show="currentQuestion.options.length > 0">
-                        <template x-for="option in currentQuestion.options" :key="option">
-                            <button @click="answerQuestion(option)"
-                                class="px-4 py-2 bg-white border border-yellow-400 rounded-lg hover:bg-yellow-100 transition">
-                                <span x-text="option"></span>
+                <!-- CÂU HỎI + NÚT BẤM -->
+                <div x-show="question" class="bg-yellow-50 border-t-4 border-yellow-400 p-5">
+                    <p class="font-semibold text-yellow-900 mb-3" x-text="question.question"></p>
+                    <div class="flex flex-wrap gap-3">
+                        <template x-for="opt in question.options">
+                            <button @click="selectOption(opt)" 
+                                class="px-5 py-3 bg-white border-2 border-yellow-400 rounded-xl hover:bg-yellow-100 transition font-medium"
+                                x-text="opt">
                             </button>
                         </template>
                     </div>
                 </div>
 
-                <!-- Final Result -->
-                <div x-show="finalResult" x-cloak class="bg-green-50 border-t-4 border-green-500 p-6">
-                    <h3 class="text-xl font-bold text-green-800">KẾT LUẬN PHẠT</h3>
-                    <template x-for="result in finalResult">
-                        <div class="mt-4 p-4 bg-white rounded-xl shadow">
-                            <p class="text-lg font-semibold" x-text="result.title"></p>
-                            <p class="mt-2 text-2xl font-bold text-red-600">
-                                Phạt: <span x-text="result.penalty?.fine"></span>
-                            </p>
-                            <p class="text-sm text-gray-600 mt-2" x-text="result.conclusion"></p>
-                            <p class="text-xs text-gray-500 mt-3">
-                                Căn cứ: <span x-text="result.code"></span>
+                <!-- KẾT LUẬN -->
+                <div x-show="result" class="bg-green-50 border-t-4 border-green-500 p-6">
+                    <h3 class="text-2xl font-bold text-green-800 mb-4">KẾT LUẬN PHẠT</h3>
+                    <template x-for="v in result.violations">
+                        <div class="bg-white rounded-xl shadow-lg p-5 mb-4">
+                            <h4 class="text-xl font-bold text-red-600" x-text="v.title"></h4>
+                            <p class="text-3xl font-black text-red-700 mt-2" x-text="v.penalty"></p>
+                            <p class="text-sm text-gray-600 mt-2" x-text="v.description"></p>
+                            <p class="text-xs font-medium text-gray-500 mt-3">
+                                Căn cứ: <span x-text="v.legal_ref"></span>
                             </p>
                         </div>
                     </template>
+                    <p class="text-center font-bold text-green-700">
+                        Tổng phạt: <span x-text="result.total || 'Đang tính...'"></span>
+                    </p>
                 </div>
 
-                <!-- Input -->
-                <div class="p-4 border-t bg-gray-50">
+                <!-- INPUT -->
+                <div class="p-5 border-t bg-gray-50">
                     <div class="flex gap-3">
-                        <input x-model="userInput" @keyup.enter="sendMessage"
-                            placeholder="Nhập mô tả hành vi..."
-                            class="flex-1 px-4 py-3 rounded-xl border focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                            :disabled="loading"/>
-                        <button @click="sendMessage" :disabled="loading || !userInput.trim()"
-                            class="px-6 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-50 transition">
+                        <input x-model="input" @keyup.enter="send()" 
+                            placeholder="Mô tả hành vi của bạn..." 
+                            class="flex-1 px-5 py-4 rounded-xl border focus:ring-4 focus:ring-indigo-300 outline-none"
+                            :disabled="loading">
+                        <button @click="send()" :disabled="loading || !input.trim()"
+                            class="px-8 py-4 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-50 font-bold">
                             <span x-show="!loading">Gửi</span>
-                            <span x-show="loading">Đang phân tích...</span>
+                            <span x-show="loading">Đang xử lý...</span>
                         </button>
-                        <button @click="resetChat" class="px-4 py-3 bg-red-500 text-white rounded-xl hover:bg-red-600">
+                        <button @click="reset()" class="px-6 py-4 bg-red-500 text-white rounded-xl hover:bg-red-600">
                             Reset
                         </button>
                     </div>
                 </div>
             </div>
+        </div>
 
-            <!-- Sidebar: Facts -->
-            <div class="bg-gray-50 p-6 border-l">
-                <h3 class="font-bold text-lg mb-4">Facts đã xác định</h3>
+        <!-- FACTS PHẢI -->
+        <div class="col-span-4">
+            <div class="bg-white rounded-2xl shadow-xl p-6">
+                <h3 class="text-xl font-bold mb-4 text-indigo-600">Facts đã xác định</h3>
                 <div class="space-y-3">
-                    <template x-for="(fact, key) in facts" :key="key">
-                        <div class="bg-white p-3 rounded-lg shadow text-sm">
-                            <span class="font-medium text-indigo-600" x-text="key"></span>:
-                            <span x-text="fact.join(', ')"></span>
+                    <template x-for="(values, key) in facts">
+                        <div class="bg-indigo-50 p-4 rounded-lg">
+                            <span class="font-bold text-indigo-700" x-text="key"></span>:
+                            <span class="font-medium" x-text="values.join(', ')"></span>
                         </div>
                     </template>
                     <div x-show="Object.keys(facts).length === 0" class="text-gray-400 text-center">
@@ -117,67 +105,37 @@
 </div>
 
 <script>
-function trafficChat() {
+function trafficBot() {
     return {
-        userInput: '',
+        input: '',
         messages: [],
         facts: {},
-        currentQuestion: null,
-        finalResult: null,
+        question: null,
+        result: null,
         loading: false,
+        sessionId: '{{ session()->getId() }}',
 
         init() {
-            this.scrollToBottom();
+            this.addMsg('Xin chào! Hãy mô tả hành vi bạn vừa làm nhé<br><small class="opacity-70">Ví dụ: Tôi đi xe máy vượt đèn đỏ có biển cấm</small>', 'assistant');
         },
 
-        scrollToBottom() {
-            this.$nextTick(() => {
-                const container = this.$refs.chatContainer || document.getElementById('chatContainer');
-                if (container) container.scrollTop = container.scrollHeight;
-            });
-        },
-
-        addMessage(content, role = 'assistant') {
+        addMsg(content, role = 'assistant') {
             this.messages.push({
                 id: Date.now(),
                 content,
                 role,
-                time: new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })
+                time: new Date().toLocaleTimeString('vi', {hour: '2-digit', minute: '2-digit'})
             });
-            this.scrollToBottom();
-        },
-
-        sendMessage() {
-            if (!this.userInput.trim() || this.loading) return;
-            const text = this.userInput.trim();
-            this.addMessage(text, 'user');
-            this.userInput = '';
-            this.loading = true;
-            console.log(text);
-
-            fetch("{{ route('inference.infer') }}", {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-CSRF-TOKEN': '{{ csrf_token() }}'
-                },
-                body: JSON.stringify({ text })
-            })
-            .then(r => r.json())
-            .then(data => {
-                console.log(data);
-                this.handleResponse(data);
-            })
-            .catch(() => {
-                this.addMessage('Lỗi kết nối hệ thống. Vui lòng thử lại!');
-            })
-            .finally(() => {
-                this.loading = false;
+            this.$nextTick(() => {
+                document.getElementById('chatBox').scrollTop = document.getElementById('chatBox').scrollHeight;
             });
         },
 
-        answerQuestion(option) {
-            this.addMessage(option, 'user');
+        send() {
+            if (!this.input.trim() || this.loading) return;
+            const text = this.input.trim();
+            this.addMsg(text, 'user');
+            this.input = '';
             this.loading = true;
 
             fetch("{{ route('inference.infer') }}", {
@@ -186,78 +144,94 @@ function trafficChat() {
                     'Content-Type': 'application/json',
                     'X-CSRF-TOKEN': '{{ csrf_token() }}'
                 },
-                body: JSON.stringify({
-                    answer: option,
-                    slot: this.currentQuestion.slot
+                body: JSON.stringify({ 
+                    session_id: this.sessionId,
+                    message: text 
                 })
             })
             .then(r => r.json())
             .then(data => {
-                this.handleResponse(data);
+                if (data.session_facts) this.facts = data.session_facts;
+                if (data.status === 'need_info' && data.questions?.length > 0) {
+                    this.question = data.questions[0];
+                    this.addMsg(this.question.question);
+                }
+                if (data.status === 'result') {
+                    this.result = data;
+                    this.question = null;
+                    const total = data.violations.reduce((s,v) => {
+                        const match = v.penalty.match(/([\d,]+)-([\d,]+)/);
+                        if (match) {
+                            const min = parseFloat(match[1].replace(/,/g, ''));
+                            const max = parseFloat(match[2].replace(/,/g, ''));
+                            const avg = (min + max) / 2;
+                            return s + avg;
+                        }
+                        return s + parseFloat(v.penalty.replace(/,/g, '')) || 0;
+                    }, 0);
+                    data.total = `${(total).toLocaleString('vi')} đồng`;
+                }
+                if (data.status === 'unknown') {
+                    this.addMsg(data.message || 'Mình chưa hiểu, bạn nói rõ hơn nhé!');
+                }
             })
-            .finally(() => {
-                this.loading = false;
-            });
+            .finally(() => this.loading = false);
         },
 
-        handleResponse(data) {
-    if (data.error) {
-        this.addMessage('Error: ' + data.error);
-        return;
-    }
+        selectOption(opt) {
+            this.addMsg(opt, 'user');
+            this.question = null;
+            this.loading = true;
 
-    // CẬP NHẬT FACTS
-    if (data.facts) {
-        this.facts = { ...this.facts, ...data.facts };
-    }
+            fetch("{{ route('inference.infer') }}", {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': '{{ csrf_token() }}'
+                },
+                body: JSON.stringify({ 
+                    session_id: this.sessionId,
+                    message: opt 
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.session_facts) this.facts = data.session_facts;
+                if (data.status === 'result') {
+                    this.result = data;
+                    const total = data.violations.reduce((s,v) => {
+                        const match = v.penalty.match(/([\d,]+)-([\d,]+)/);
+                        if (match) {
+                            const min = parseFloat(match[1].replace(/,/g, ''));
+                            const max = parseFloat(match[2].replace(/,/g, ''));
+                            const avg = (min + max) / 2;
+                            return s + avg;
+                        }
+                        return s + parseFloat(v.penalty.replace(/,/g, '')) || 0;
+                    }, 0);
+                    data.total = `${total.toLocaleString('vi')} đồng`;
+                }
+            })
+            .finally(() => this.loading = false);
+        },
 
-    // RESET currentQuestion VỀ OBJECT RỖNG (KHÔNG PHẢI null)
-    this.currentQuestion = { question: '', options: [], slot: '' };
-
-    if (data.status === 'need_info' && data.questions && data.questions.length > 0) {
-        const q = data.questions[0];
-        this.currentQuestion = {
-            slot: q.slot || '',
-            question: q.question || 'Bạn có thể nói rõ hơn không?',
-            options: Array.isArray(q.options) ? q.options : []
-        };
-        this.addMessage(this.currentQuestion.question);
-    }
-
-    if (data.status === 'result' && data.results && data.results.length > 0) {
-        this.finalResult = data.results;
-        this.currentQuestion = { question: '', options: [], slot: '' }; // reset
-        data.results.forEach(r => {
-            const fine = r.penalty?.fine || 'Chưa xác định';
-            const code = r.code || 'Nghị định 100/2019';
-            this.addMessage(`
-                <strong class="text-lg">${r.title}</strong><br>
-                <span class="text-2xl font-bold text-red-600">Phạt: ${fine} VNĐ</span><br>
-                <span class="text-sm text-gray-600">${r.conclusion || ''}</span><br>
-                <span class="text-xs text-gray-500">Căn cứ: ${code}</span>
-            `);
-        });
-    }
-
-    if (data.status === 'unknown') {
-        this.addMessage(data.questions?.[0]?.question || "Mình chưa hiểu rõ. Bạn mô tả lại nhé!");
-    }
-},
-
-        resetChat() {
+        reset() {
             if (!confirm('Xóa toàn bộ cuộc trò chuyện?')) return;
-            this.messages = [];
-            this.facts = {};
-            this.currentQuestion = null;
-            this.finalResult = null;
             fetch("{{ route('inference.reset') }}", {
                 method: 'POST',
-                headers: { 'X-CSRF-TOKEN': '{{ csrf_token() }}' }
-            });
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': '{{ csrf_token() }}'
+                }
+            })
+            this.messages = [];
+            this.facts = {};
+            this.question = null;
+            this.result = null;
+            this.addMsg('Đã reset! Hãy bắt đầu lại nhé', 'assistant');
         }
     }
 }
 </script>
-
 </body>
 </html>

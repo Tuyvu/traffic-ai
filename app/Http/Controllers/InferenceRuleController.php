@@ -23,13 +23,22 @@ class InferenceRuleController extends Controller
         $sessionId = $req->session()->getId();
         $payload = [
             'session_id' => $sessionId,
-            'text' => $req->input('text'), // or 'facts'
+            'message' => $req->message, // or 'facts'
         ];
         // $resp = Http::post(env('CORE_URL').'/infer', $payload);
         $resp = Http::withHeaders([
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
             ])->post('http://service-appsra:5000/infer', $payload);
+        return response()->json($resp->json());
+    }
+    public function reset(Request $req) 
+    {
+        $sessionId = $req->session()->getId();
+        $resp = Http::withHeaders([
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
+            ])->post("http://service-appsra:5000/reset/{$sessionId}");
         return response()->json($resp->json());
     }
 
