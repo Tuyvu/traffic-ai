@@ -4,8 +4,9 @@ import re
 import json
 import traceback
 from typing import Dict, List, Any, Optional, Tuple
+from difflib import SequenceMatcher
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError
@@ -29,19 +30,97 @@ VIETNAMESE_KEYWORDS = {
         "không đội mũ bảo hiểm": ["không đội mũ", "không mũ bảo hiểm", "không mbh", "chạy không mũ"],
         "đi ngược chiều": ["ngược chiều", "đi ngược đường", "chạy ngược", "đi ngược làn"],
         "vượt ẩu": ["vượt ẩu", "vượt xe nguy hiểm", "vượt bên phải", "cắt đầu xe"],
-        "đi vào đường cấm": ["đi vào đường cấm", "vào đường cấm", "đi ngược chiều cấm"],
         "lạng lách": ["lạng lách", "đánh võng", "lách đánh võng"],
-        "chở quá số người": ["chở 3", "chở 4", "chở quá người", "chở 3 người"],
+        "chở quá người": ["chở 3", "chở 4", "chở quá người", "chở 3 người"],
+        "dừng đỗ sai quy định": ["dừng sai chỗ", "đỗ sai nơi quy định", "dừng đỗ trái phép"],
+        "chuyển hướng không an toàn": ["chuyển hướng không quan sát", "rẽ không báo hiệu", "quay đầu không an toàn"],
+        "chuyển làn không đúng": ["chuyển làn không báo hiệu", "sang làn ẩu", "chuyển nhiều làn"],
+        "chạy quá tốc độ": ["chạy quá tốc độ", "vượt quá tốc độ", "phóng nhanh"],
+        "chạy tốc độ thấp gây cản trở": ["chạy quá chậm", "tốc độ thấp gây cản trở"],
+        "không xử lý tai nạn": ["gây tai nạn bỏ chạy", "không dừng lại sau tai nạn"],
+        "đi vào đường cấm": ["đi vào đường cấm", "vào đường cấm", "đi ngược chiều cấm"],
+        "điều khiển xe 1 bánh/2 bánh": ["chạy một bánh", "chạy hai bánh", "wheelie"],
+        "điều khiển xe dàn hàng ngang": ["dàn hàng ngang", "chạy hàng ngang"],
+        "kéo theo xe khác": ["kéo theo xe", "kéo xe khác"],
+        "gây tai nạn": ["gây tai nạn", "đâm va tai nạn"],
+        "điều khiển xe thành đoàn": ["đi thành đoàn", "chạy đoàn xe"],
+        "nhóm xe chạy quá tốc độ": ["nhóm xe chạy nhanh", "cả nhóm vượt tốc độ"],
+        "bỏ chạy sau tai nạn": ["bỏ chạy sau tai nạn", "tai nạn rồi bỏ đi"],
+        "không chấp hành biển báo": ["không tuân theo biển báo", "vượt biển cấm"],
+        "không có tín hiệu khi vượt": ["vượt không báo hiệu", "vượt không xi nhan"]
     },
     "vehicle_type": {
         "xe máy": ["xe máy", "môtô", "motor", "xe may", "xe gắn máy"],
         "ô tô": ["ô tô", "oto", "xe hơi", "xe con", "xe tải", "xe khách"],
+        "xe đạp": ["xe đạp", "xe đạp điện"],
+        "xe ba bánh": ["xe ba bánh", "xích lô"]
     },
     "context": {
         "có biển cấm vượt": ["có biển cấm vượt", "biển cấm vượt", "cấm vượt", "biển 104"],
         "đường cao tốc": ["cao tốc", "đường cao tốc"],
-        "khu vực đông dân cư": ["khu dân cư", "đông dân", "trong phố"],
         "ban đêm": ["ban đêm", "tối", "đêm khuya"],
+        "khu dân cư đông": ["khu dân cư", "đông dân", "trong phố"],
+        "đường một chiều": ["đường một chiều", "một chiều"],
+        "đường cấm ngược chiều": ["đường cấm ngược chiều", "cấm ngược chiều"],
+        "khu vực cấm": ["khu vực cấm", "vào khu vực cấm"],
+        "đường cong không giao nhau": ["đường cong", "đường vòng"],
+        "trên cầu": ["trên cầu", "cầu"],
+        "điểm đón trả khách": ["điểm đón khách", "bến xe bus"],
+        "nơi đường giao nhau": ["ngã tư", "ngã ba", "giao lộ"],
+        "phần đường người đi bộ": ["vạch người đi bộ", "làn người đi bộ"],
+        "hầm đường bộ": ["trong hầm", "hầm đường bộ"],
+        "lề đường": ["lề đường", "vạt đường"]
+    },
+    "so_nguoi_ngoi_sau": {
+        "1 người": ["1 người", "một mình"],
+        "2 người": ["2 người", "hai người"],
+        "3 người": ["3 người", "ba người"],
+        "4 người trở lên": ["4 người", "nhiều người", "trên 3 người"]
+    },
+    "vi_tri_dung_do": {
+        "lòng đường": ["lòng đường", "giữa đường"],
+        "vỉa hè": ["vỉa hè", "hè phố"],
+        "trên cầu": ["trên cầu", "cầu"],
+        "điểm đón trả khách": ["điểm đón khách", "bến xe bus"],
+        "nơi đường giao nhau": ["ngã tư", "ngã ba", "giao lộ"],
+        "phần đường người đi bộ": ["vạch người đi bộ", "làn người đi bộ"],
+        "hầm đường bộ": ["trong hầm", "hầm đường bộ"],
+        "đường cao tốc": ["cao tốc", "đường cao tốc"],
+        "nơi có biển cấm dừng đỗ": ["biển cấm dừng", "biển cấm đỗ"]
+    },
+    "hanh_dong_chuyen_huong": {
+        "không quan sát": ["không quan sát", "không nhìn"],
+        "không báo hiệu": ["không báo hiệu", "không xi nhan"],
+        "không giảm tốc độ": ["không giảm tốc", "vẫn giữ tốc độ"],
+        "chuyển hướng đột ngột": ["chuyển hướng đột ngột", "rẽ đột ngột"],
+        "chuyển hướng an toàn": ["chuyển hướng an toàn", "rẽ an toàn"]
+    },
+    "hanh_dong_chuyen_lan": {
+        "không báo hiệu": ["không báo hiệu", "không xi nhan"],
+        "chuyển nhiều làn cùng lúc": ["chuyển nhiều làn", "sang nhiều làn"],
+        "chuyển làn sai nơi quy định": ["sai nơi quy định", "chuyển làn ẩu"],
+        "chuyển làn an toàn": ["chuyển làn an toàn", "sang làn đúng"]
+    },
+    "huong_di_chuyen": {
+        "đúng chiều": ["đúng chiều", "chiều đúng"],
+        "ngược chiều": ["ngược chiều", "sai chiều"],
+        "trên vỉa hè": ["trên vỉa hè", "lên vỉa hè"],
+        "trên lề đường": ["trên lề đường", "lề đường"]
+    },
+    "loai_duong": {
+        "đường trong khu dân cư": ["khu dân cư", "trong phố"],
+        "đường cao tốc": ["cao tốc", "đường cao tốc"],
+        "đường một chiều": ["đường một chiều", "một chiều"],
+        "đường cấm ngược chiều": ["đường cấm ngược chiều", "cấm ngược chiều"],
+        "đường đôi": ["đường đôi", "chia hai chiều"],
+        "đường ngoại thành": ["ngoại thành", "đường liên tỉnh"]
+    },
+    "toc_do": {
+        "dưới 40 km/h": ["chậm", "dưới 40"],
+        "40-60 km/h": ["40-60", "trung bình"],
+        "60-80 km/h": ["60-80", "khá nhanh"],
+        "80-100 km/h": ["80-100", "nhanh"],
+        "trên 100 km/h": ["trên 100", "rất nhanh"]
     }
 }
 
@@ -55,24 +134,48 @@ for slot, groups in VIETNAMESE_KEYWORDS.items():
 def extract_facts_smart(text: str) -> Dict[str, List[str]]:
     text = text.lower()
     facts = {}
+    matched_phrases = set()
     
-    for phrase, (slot, canonical) in CANONICAL_MAP.items():
-        if phrase in text:
-            facts.setdefault(slot, []).append(canonical)
+    # Strategy 1: Exact substring match từ ATTRIBUTES_MAPPING
+    for value, attr in ATTRIBUTES_MAPPING.items():
+        if value in text:
+            facts.setdefault(attr, []).append(value)
+            matched_phrases.add(value)
     
-    # Đặc biệt: nếu có "xe máy" mà không có vehicle_type → thêm
-    # if any(x in text for x in ["xe máy", "môtô", "motor"]):
-    #     facts.setdefault("vehicle_type", []).append("xe máy")
-    # if any(x in text for x in ["ô tô", "oto", "xe hơi"]):
-    #     facts.setdefault("vehicle_type", []).append("ô tô")
-        
+    # Strategy 2: Fuzzy matching với similarity > 0.6
+    # (CHẠY ĐỒNG THỜI với Strategy 1, không phải if not facts)
+    best_matches = {}
+    for value, attr in ATTRIBUTES_MAPPING.items():
+        if value in matched_phrases:
+            continue  # Skip nếu đã match exact
+        # Tính similarity giữa value và text
+        ratio = SequenceMatcher(None, value, text).ratio()
+        if ratio > 0.4:  # ← Hạ từ 0.6 xuống 0.4
+            if attr not in best_matches or best_matches[attr][1] < ratio:
+                best_matches[attr] = (value, ratio)
+    
+    for attr, (value, ratio) in best_matches.items():
+        facts.setdefault(attr, []).append(value)
+    
+    # Strategy 3: Keyword matching từ CANONICAL_MAP (hardcoded từ trước)
+    if not facts:
+        for phrase, (slot, canonical) in CANONICAL_MAP.items():
+            if phrase in text:
+                facts.setdefault(slot, []).append(canonical)
+    
     # Dedup
     for k in facts:
         facts[k] = list(set(facts[k]))
+    
+    print(f"[EXTRACT] text='{text}' -> facts={facts}")
     return facts
 
 # ============== LOAD RULES (SIÊU ỔN ĐỊNH) ==============
+# Global để lưu attribute mapping
+ATTRIBUTES_MAPPING = {}
+
 def load_rules_from_db() -> List[Dict[str, Any]]:
+    global ATTRIBUTES_MAPPING
     db = SessionLocal()
     try:
         from sqlalchemy import MetaData
@@ -97,11 +200,20 @@ def load_rules_from_db() -> List[Dict[str, Any]]:
             for crow in db.execute(cond_q).fetchall():
                 attr = crow.attribute
                 val = crow.value
+                print(f"[LOAD_COND] Rule {rule_id}: attr={attr}, val={val!r} (type={type(val).__name__})")
                 try:
                     values = json.loads(val) if val.strip().startswith('[') else [v.strip() for v in val.split(',') if v.strip()]
-                except:
+                except Exception as e:
+                    print(f"[LOAD_COND] ERROR parsing: {e}")
                     values = [val.strip()] if val else []
+                # Lowercase tất cả values để avoid case-sensitivity issues
+                values = [v.lower() for v in values]
+                print(f"[LOAD_COND] → parsed values={values}")
                 conds.setdefault(attr, []).extend(values)
+                
+                # Lưu mapping: mỗi value -> attribute
+                for v in values:
+                    ATTRIBUTES_MAPPING[v] = attr
             
             rule["conditions"] = conds
             rule["priority"] = int(rule.get("priority", 0))
@@ -125,7 +237,16 @@ def load_rules_from_db() -> List[Dict[str, Any]]:
         
         # Sắp xếp theo priority (cao hơn = nặng hơn)
         rules.sort(key=lambda x: x["priority"], reverse=True)
-        print(f"Loaded {len(rules)} rules (sorted by priority)")
+        print(f"\nLoaded {len(rules)} rules (sorted by priority)")
+        print(f"\n=== ATTRIBUTES_MAPPING ===")
+        for value, attr in sorted(ATTRIBUTES_MAPPING.items()):
+            print(f"  '{value}' -> '{attr}'")
+        print(f"=== END ATTRIBUTES_MAPPING ===")
+        
+        print(f"\n=== RULES CONDITIONS ===")
+        for rule in rules:
+            print(f"Rule {rule['id']} ({rule.get('title', 'NO TITLE')}): conditions={rule['conditions']}")
+        print(f"=== END RULES CONDITIONS ===\n")
         return rules
 
     except Exception as e:
@@ -145,16 +266,41 @@ async def startup():
 
 # ============== INFERENCE ENGINE ==============
 def forward_chaining(facts: Dict[str, List[str]]) -> List[Dict]:
+    """
+    Forward chaining: match rules dựa trên facts hiện có.
+    Logic: Nếu CÓ ÍT NHẤT 1 điều kiện của rule match → coi như match
+    (Thay vì yêu cầu TẤT CẢ điều kiện match)
+    """
     matched = []
     for rule in RULES:
         conds = rule["conditions"]
-        match = True
+        # Đếm số điều kiện match
+        matched_conds = 0
+        
+        print(f"[FC] Checking Rule {rule['id']}: conditions={conds}")
+        print(f"[FC]   Current facts={facts}")
+        
         for slot, required in conds.items():
-            if slot not in facts or not any(req in facts[slot] for req in required):
-                match = False
-                break
-        if match:
+            print(f"[FC]   Checking slot '{slot}': required={required}")
+            if slot in facts:
+                print(f"[FC]     Slot exists in facts: {facts[slot]}")
+                for req in required:
+                    if req in facts[slot]:
+                        print(f"[FC]       MATCH: '{req}'")
+                        matched_conds += 1
+                        break  # 1 slot chỉ tính 1 lần
+                    else:
+                        print(f"[FC]       NO MATCH: '{req}' NOT in {facts[slot]}")
+            else:
+                print(f"[FC]     Slot '{slot}' NOT in facts")
+        
+        # Nếu có ít nhất 1 điều kiện match → coi như match
+        if matched_conds > 0:
+            print(f"[FC] ✓ Rule {rule['id']}: matched {matched_conds}/{len(conds)} conditions")
             matched.append(rule)
+        else:
+            print(f"[FC] ✗ Rule {rule['id']}: no conditions matched")
+    
     return matched
 
 # THAY TOÀN BỘ hàm find_missing_conditions() bằng cái này
@@ -182,10 +328,14 @@ def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dic
     # Chỉ hỏi những slot CHƯA hỏi
     for rule, score in candidate_rules[:3]:  # chỉ xét 3 rule tốt nhất
         for slot, reqs in rule["conditions"].items():
+            # Skip nếu đã có dữ liệu cho slot này
+            if slot in facts and any(r in facts[slot] for r in reqs):
+                continue
+            # Skip nếu đã hỏi lần trước
             if slot in asked_slots:
                 continue
-            if slot not in facts or not any(r in facts[slot] for r in reqs):
-                missing.setdefault(slot, set()).update(reqs[:5])  # giới hạn 5 gợi ý
+            # Thêm vào danh sách cần hỏi
+            missing.setdefault(slot, set()).update(reqs[:5])  # giới hạn 5 gợi ý
     
     # LƯU LẠI NHỮNG SLOT SẮP HỎI ĐỂ LẦN SAU KHÔNG LẶP
     if missing:
@@ -195,17 +345,76 @@ def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dic
     return {k: list(v) for k, v in missing.items()}
 # ============== SMART QUESTIONS ==============
 SMART_QUESTIONS = {
-    "vehicle_type": {
-        "question": "Bạn đang điều khiển loại xe nào?",
-        "options": ["xe máy", "ô tô", "xe tải", "xe khách", "xe đạp"]
-    },
     "action": {
         "question": "Bạn đã làm hành vi gì?",
-        "options": ["vượt đèn đỏ", "không đội mũ bảo hiểm", "đi ngược chiều", "vượt ẩu", "lạng lách", "chở quá người"]
+        "options": [
+            "vượt đèn đỏ", "không đội mũ bảo hiểm", "đi ngược chiều", "vượt ẩu", 
+            "lạng lách", "chở quá người", "dừng đỗ sai quy định", "chuyển hướng không an toàn",
+            "chuyển làn không đúng", "chạy quá tốc độ", "chạy tốc độ thấp gây cản trở",
+            "không xử lý tai nạn", "đi vào đường cấm", "điều khiển xe 1 bánh/2 bánh",
+            "điều khiển xe dàn hàng ngang", "kéo theo xe khác", "gây tai nạn",
+            "điều khiển xe thành đoàn", "nhóm xe chạy quá tốc độ", "bỏ chạy sau tai nạn",
+            "không chấp hành biển báo", "không có tín hiệu khi vượt"
+        ]
+    },
+    "vehicle_type": {
+        "question": "Bạn đang điều khiển loại xe nào?",
+        "options": ["xe máy", "ô tô", "xe tải", "xe khách", "xe đạp", "xe ba bánh"]
     },
     "context": {
         "question": "Có tình huống đặc biệt nào không?",
-        "options": ["có biển cấm vượt", "đường cao tốc", "ban đêm", "khu dân cư đông", "không có gì đặc biệt"]
+        "options": [
+            "có biển cấm vượt", "đường cao tốc", "ban đêm", "khu dân cư đông", 
+            "không có gì đặc biệt", "đường một chiều", "đường cấm ngược chiều",
+            "khu vực cấm", "đường cong không giao nhau", "trên cầu",
+            "điểm đón trả khách", "nơi đường giao nhau", "phần đường người đi bộ",
+            "hầm đường bộ", "lề đường"
+        ]
+    },
+    "so_nguoi_ngoi_sau": {
+        "question": "Xe của bạn đang chở bao nhiêu người (tính cả người lái)?",
+        "options": ["1 người", "2 người", "3 người", "4 người trở lên"]
+    },
+    "vi_tri_dung_do": {
+        "question": "Bạn dừng/đỗ xe ở đâu?",
+        "options": [
+            "lòng đường", "vỉa hè", "trên cầu", "điểm đón trả khách", 
+            "nơi đường giao nhau", "phần đường người đi bộ", "hầm đường bộ",
+            "đường cao tốc", "nơi có biển cấm dừng đỗ"
+        ]
+    },
+    "hanh_dong_chuyen_huong": {
+        "question": "Bạn đã chuyển hướng như thế nào?",
+        "options": [
+            "không quan sát", "không báo hiệu", "không giảm tốc độ", 
+            "chuyển hướng đột ngột", "chuyển hướng an toàn"
+        ]
+    },
+    "hanh_dong_chuyen_lan": {
+        "question": "Bạn đã chuyển làn như thế nào?",
+        "options": [
+            "không báo hiệu", "chuyển nhiều làn cùng lúc", "chuyển làn sai nơi quy định",
+            "chuyển làn an toàn"
+        ]
+    },
+    "huong_di_chuyen": {
+        "question": "Bạn đang đi như thế nào?",
+        "options": [
+            "đúng chiều", "ngược chiều", "trên vỉa hè", "trên lề đường"
+        ]
+    },
+    "loai_duong": {
+        "question": "Bạn đang đi trên loại đường nào?",
+        "options": [
+            "đường trong khu dân cư", "đường cao tốc", "đường một chiều", 
+            "đường cấm ngược chiều", "đường đôi", "đường ngoại thành"
+        ]
+    },
+    "toc_do": {
+        "question": "Bạn đang chạy với tốc độ bao nhiêu?",
+        "options": [
+            "dưới 40 km/h", "40-60 km/h", "60-80 km/h", "80-100 km/h", "trên 100 km/h"
+        ]
     }
 }
 
@@ -221,9 +430,9 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     status: str  # "result" | "need_info" | "unknown"
     message: str = None
-    violations: List[Dict] = None
-    questions: List[Dict] = None
-    session_facts: Dict[str, List[str]] = None
+    violations: List[Dict] = Field(default_factory=list)
+    questions: List[Dict] = Field(default_factory=list)
+    session_facts: Dict[str, List[str]] = Field(default_factory=dict)
 
 # ============== SESSION ==============
 def get_facts(sid: str) -> Dict[str, List[str]]:
@@ -267,9 +476,23 @@ async def infer(req: QueryRequest):
     for v in violations:
         print(f"Matched rule: {v['id']} with priority {v.get('priority')}")
 
-    if violations:
+    # Check xem rules đã đủ điều kiện chưa (ALL conditions match)
+    fully_matched = []
+    for rule in violations:
+        conds = rule["conditions"]
+        all_matched = True
+        for slot, required in conds.items():
+            if slot not in current_facts or not any(req in current_facts[slot] for req in required):
+                all_matched = False
+                break
+        if all_matched:
+            fully_matched.append(rule)
+        print(f"[CHECK] Rule {rule['id']}: all_matched={all_matched}")
+    
+    # Nếu có rule FULLY matched → return result
+    if fully_matched:
         results = []
-        for v in violations:
+        for v in fully_matched:
             results.append({
                 "id": v["code"] or v["id"],
                 "title": v.get("title", "Vi phạm giao thông"),
@@ -278,14 +501,33 @@ async def infer(req: QueryRequest):
                 "additional": v['penalty'].get("additional", ""),
                 "description": v.get("conclusion", "Bạn đã vi phạm luật giao thông đường bộ")
             })
-        
+        # Also compute missing questions for other partially-matched rules
+        missing = find_missing_conditions(current_facts, req.session_id)
+        questions = []
+        if missing:
+            for slot in missing.keys():
+                template = SMART_QUESTIONS.get(slot, {
+                    "question": f"Cho mình biết về {slot} nhé?",
+                    "options": missing[slot][:5]
+                })
+                questions.append({
+                    "slot": slot,
+                    "question": template["question"],
+                    "options": template["options"]
+                })
+
         return QueryResponse(
             status="result",
-            message=f"Đã phát hiện {len(violations)} hành vi vi phạm!",
+            message=f"Đã phát hiện {len(fully_matched)} hành vi vi phạm!",
             violations=results,
+            questions=questions,
             session_facts=current_facts
         )
 
+    # Nếu có partial match nhưng chưa đủ → hỏi missing conditions
+    if violations:
+        print(f"[BACKWARD] {len(violations)} rules partially matched, asking for missing conditions...")
+    
     # Nếu chưa đủ dữ liệu → hỏi lại
     missing = find_missing_conditions(current_facts, req.session_id)
     if missing:
