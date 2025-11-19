@@ -26,7 +26,10 @@ RUN pip install \
     sqlalchemy \
     redis \
     pymysql>=1.1.0 \
-    cryptography>=41.0.0
+    cryptography>=41.0.0 \
+    sentence-transformers \
+    torch 
+
 # Copy source code
 COPY . .
 
