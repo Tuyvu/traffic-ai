@@ -1,16 +1,19 @@
-# file: app.py (PHIÊN BẢN HOÀN CHỈNH - PRODUCTION READY)
+# file: app.py (PHIÊN BẢN HOÀN CHỈNH VỚI EMBEDDING)
 import os
 import re
 import json
 import traceback
+import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
 from difflib import SequenceMatcher
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError
 import redis
+from sentence_transformers import SentenceTransformer
+import torch
 
 # ============== CONFIG ==============
 DATABASE_URL = f"mysql+pymysql://{os.getenv('DB_USERNAME')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_DATABASE')}"
@@ -21,7 +24,164 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=3600, echo
 SessionLocal = sessionmaker(bind=engine)
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-app = FastAPI(title="Vietnam Traffic Law Inference Engine", version="2.0.0")
+app = FastAPI(title="Vietnam Traffic Law Inference Engine", version="3.0.0")
+
+# ============== EMBEDDING MODEL ==============
+MODEL_NAME = "keepitreal/vietnamese-sbert"
+model = None
+
+@app.on_event("startup")
+async def startup():
+    global model, RULES, RULE_CONDITIONS
+    print("Loading embedding model...")
+    model = SentenceTransformer(MODEL_NAME)
+    print("Model loaded successfully!")
+    
+    RULES, RULE_CONDITIONS = load_rules_from_db()
+    if not RULES:
+        print("CRITICAL: NO RULES LOADED!")
+
+# ============== EMBEDDING UTILS ==============
+def get_embedding(text: str) -> List[float]:
+    """Generate embedding for text"""
+    if not text or not text.strip():
+        return [0.0] * 384  # Default dimension
+    
+    with torch.no_grad():
+        embedding = model.encode(text, normalize_embeddings=True)
+    return embedding.tolist()
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Calculate cosine similarity between two vectors"""
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+def find_similar_rules(query_embedding: List[float], threshold: float = 0.7) -> List[Dict]:
+    """Find rules with similar conditions using embedding similarity"""
+    similar_rules = []
+    
+    for rule_cond in RULE_CONDITIONS:
+        similarity = cosine_similarity(query_embedding, rule_cond["embedding"])
+        if similarity >= threshold:
+            # Find the rule details
+            rule = next((r for r in RULES if r["id"] == rule_cond["rule_id"]), None)
+            if rule and rule not in similar_rules:
+                similar_rules.append({
+                    "rule": rule,
+                    "similarity": similarity,
+                    "matched_condition": rule_cond
+                })
+    
+    # Sort by similarity score
+    similar_rules.sort(key=lambda x: x["similarity"], reverse=True)
+    return similar_rules
+
+# ============== LOAD RULES WITH EMBEDDING ==============
+ATTRIBUTES_MAPPING = {}
+RULE_CONDITIONS = []
+
+def load_rules_from_db() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    global ATTRIBUTES_MAPPING, RULE_CONDITIONS
+    db = SessionLocal()
+    try:
+        from sqlalchemy import MetaData
+        metadata = MetaData()
+        metadata.reflect(bind=engine, only=['rules', 'rule_conditions', 'penalties'])
+        
+        rules_table = metadata.tables['rules']
+        cond_table = metadata.tables['rule_conditions']
+        penalty_table = metadata.tables['penalties']
+
+        # Load all active rules
+        query = select(rules_table).where(rules_table.c.active == 1)
+        rows = db.execute(query).fetchall()
+
+        rules = []
+        rule_conditions = []
+        
+        for row in rows:
+            rule = dict(row._mapping)
+            rule_id = rule["id"]
+
+            # Load conditions with embeddings
+            cond_q = select(cond_table).where(cond_table.c.rule_id == rule_id)
+            conds = {}
+            for crow in db.execute(cond_q).fetchall():
+                attr = crow.attribute
+                val = crow.value
+                embedding = crow.embedding
+                
+                print(f"[LOAD_COND] Rule {rule_id}: attr={attr}, val={val!r}")
+                try:
+                    if embedding:
+                        # Parse embedding from database (assuming it's stored as JSON string)
+                        embedding_vec = json.loads(embedding)
+                    else:
+                        # Fallback: generate embedding from attribute + value
+                        text_to_embed = f"{attr} {val}"
+                        embedding_vec = get_embedding(text_to_embed)
+                except Exception as e:
+                    print(f"[LOAD_COND] ERROR processing embedding: {e}")
+                    text_to_embed = f"{attr} {val}"
+                    embedding_vec = get_embedding(text_to_embed)
+                
+                # Store condition with embedding
+                rule_cond = {
+                    "rule_id": rule_id,
+                    "attribute": attr,
+                    "value": val,
+                    "embedding": embedding_vec
+                }
+                rule_conditions.append(rule_cond)
+                
+                # Parse values for traditional matching
+                try:
+                    values = json.loads(val) if val.strip().startswith('[') else [v.strip() for v in val.split(',') if v.strip()]
+                except Exception as e:
+                    print(f"[LOAD_COND] ERROR parsing values: {e}")
+                    values = [val.strip()] if val else []
+                
+                values = [v.lower() for v in values]
+                conds.setdefault(attr, []).extend(values)
+                
+                # Build attributes mapping
+                for v in values:
+                    ATTRIBUTES_MAPPING[v] = attr
+            
+            rule["conditions"] = conds
+            rule["priority"] = int(rule.get("priority", 0))
+
+            # Load penalty
+            if rule.get("penalty_id"):
+                p = db.execute(select(penalty_table).where(penalty_table.c.id == rule["penalty_id"])).fetchone()
+                if p:
+                    penalty = dict(p._mapping)
+                    fine_min = int(float(penalty.get("fine_min", 0))) if penalty.get("fine_min") else 0
+                    fine_max = int(float(penalty.get("fine_max", 0))) if penalty.get("fine_max") else 0
+                    rule["penalty"] = {
+                        "amount": f"{fine_min:,}-{fine_max:,}" if fine_min and fine_max else f"{fine_max or fine_min:,}",
+                        "unit": penalty.get("unit", "đồng"),
+                        "additional": penalty.get("additional_punishment", ""),
+                        "legal_ref": penalty.get("law_ref", "")
+                    }
+
+            rules.append(rule)
+        
+        # Sort rules by priority
+        rules.sort(key=lambda x: x["priority"], reverse=True)
+        
+        print(f"\nLoaded {len(rules)} rules and {len(rule_conditions)} conditions with embeddings")
+        return rules, rule_conditions
+
+    except Exception as e:
+        print(f"ERROR loading rules: {e}")
+        traceback.print_exc()
+        return [], []
+    finally:
+        db.close()
+
+RULES = []
 
 # ============== VIETNAMESE LEGAL NLP ==============
 VIETNAMESE_KEYWORDS = {
@@ -142,22 +302,20 @@ def extract_facts_smart(text: str) -> Dict[str, List[str]]:
             facts.setdefault(attr, []).append(value)
             matched_phrases.add(value)
     
-    # Strategy 2: Fuzzy matching với similarity > 0.6
-    # (CHẠY ĐỒNG THỜI với Strategy 1, không phải if not facts)
+    # Strategy 2: Fuzzy matching với similarity > 0.4
     best_matches = {}
     for value, attr in ATTRIBUTES_MAPPING.items():
         if value in matched_phrases:
-            continue  # Skip nếu đã match exact
-        # Tính similarity giữa value và text
+            continue
         ratio = SequenceMatcher(None, value, text).ratio()
-        if ratio > 0.4:  # ← Hạ từ 0.6 xuống 0.4
+        if ratio > 0.4:
             if attr not in best_matches or best_matches[attr][1] < ratio:
                 best_matches[attr] = (value, ratio)
     
     for attr, (value, ratio) in best_matches.items():
         facts.setdefault(attr, []).append(value)
     
-    # Strategy 3: Keyword matching từ CANONICAL_MAP (hardcoded từ trước)
+    # Strategy 3: Keyword matching từ CANONICAL_MAP
     if not facts:
         for phrase, (slot, canonical) in CANONICAL_MAP.items():
             if phrase in text:
@@ -170,111 +328,17 @@ def extract_facts_smart(text: str) -> Dict[str, List[str]]:
     print(f"[EXTRACT] text='{text}' -> facts={facts}")
     return facts
 
-# ============== LOAD RULES (SIÊU ỔN ĐỊNH) ==============
-# Global để lưu attribute mapping
-ATTRIBUTES_MAPPING = {}
-
-def load_rules_from_db() -> List[Dict[str, Any]]:
-    global ATTRIBUTES_MAPPING
-    db = SessionLocal()
-    try:
-        from sqlalchemy import MetaData
-        metadata = MetaData()
-        metadata.reflect(bind=engine, only=['rules', 'rule_conditions', 'penalties'])
-        
-        rules_table = metadata.tables['rules']
-        cond_table = metadata.tables['rule_conditions']
-        penalty_table = metadata.tables['penalties']
-
-        query = select(rules_table).where(rules_table.c.active == 1)
-        rows = db.execute(query).fetchall()
-
-        rules = []
-        for row in rows:
-            rule = dict(row._mapping)
-            rule_id = rule["id"]
-
-            # Load conditions
-            cond_q = select(cond_table).where(cond_table.c.rule_id == rule_id)
-            conds = {}
-            for crow in db.execute(cond_q).fetchall():
-                attr = crow.attribute
-                val = crow.value
-                print(f"[LOAD_COND] Rule {rule_id}: attr={attr}, val={val!r} (type={type(val).__name__})")
-                try:
-                    values = json.loads(val) if val.strip().startswith('[') else [v.strip() for v in val.split(',') if v.strip()]
-                except Exception as e:
-                    print(f"[LOAD_COND] ERROR parsing: {e}")
-                    values = [val.strip()] if val else []
-                # Lowercase tất cả values để avoid case-sensitivity issues
-                values = [v.lower() for v in values]
-                print(f"[LOAD_COND] → parsed values={values}")
-                conds.setdefault(attr, []).extend(values)
-                
-                # Lưu mapping: mỗi value -> attribute
-                for v in values:
-                    ATTRIBUTES_MAPPING[v] = attr
-            
-            rule["conditions"] = conds
-            rule["priority"] = int(rule.get("priority", 0))
-
-            # Load penalty
-            if rule.get("penalty_id"):
-                p = db.execute(select(penalty_table).where(penalty_table.c.id == rule["penalty_id"])).fetchone()
-                print(f"Loading penalty for rule {rule_id}: {p}")
-                if p:
-                    penalty = dict(p._mapping)
-                    fine_min = int(float(penalty.get("fine_min", 0))) if penalty.get("fine_min") else 0
-                    fine_max = int(float(penalty.get("fine_max", 0))) if penalty.get("fine_max") else 0
-                    rule["penalty"] = {
-                        "amount": f"{fine_min:,}-{fine_max:,}" if fine_min and fine_max else f"{fine_max or fine_min:,}",
-                        "unit": penalty.get("unit", "đồng"),
-                        "additional": penalty.get("additional_punishment", ""),
-                        "legal_ref": penalty.get("law_ref", "")
-                    }
-
-            rules.append(rule)
-        
-        # Sắp xếp theo priority (cao hơn = nặng hơn)
-        rules.sort(key=lambda x: x["priority"], reverse=True)
-        print(f"\nLoaded {len(rules)} rules (sorted by priority)")
-        print(f"\n=== ATTRIBUTES_MAPPING ===")
-        for value, attr in sorted(ATTRIBUTES_MAPPING.items()):
-            print(f"  '{value}' -> '{attr}'")
-        print(f"=== END ATTRIBUTES_MAPPING ===")
-        
-        print(f"\n=== RULES CONDITIONS ===")
-        for rule in rules:
-            print(f"Rule {rule['id']} ({rule.get('title', 'NO TITLE')}): conditions={rule['conditions']}")
-        print(f"=== END RULES CONDITIONS ===\n")
-        return rules
-
-    except Exception as e:
-        print(f"ERROR loading rules: {e}")
-        traceback.print_exc()
-        return []
-    finally:
-        db.close()
-
-RULES = []
-@app.on_event("startup")
-async def startup():
-    global RULES
-    RULES = load_rules_from_db()
-    if not RULES:
-        print("CRITICAL: NO RULES LOADED!")
-
 # ============== INFERENCE ENGINE ==============
-def forward_chaining(facts: Dict[str, List[str]]) -> List[Dict]:
+def forward_chaining(facts: Dict[str, List[str]], candidate_rules: List[Dict] = None) -> List[Dict]:
     """
     Forward chaining: match rules dựa trên facts hiện có.
-    Logic: Nếu CÓ ÍT NHẤT 1 điều kiện của rule match → coi như match
-    (Thay vì yêu cầu TẤT CẢ điều kiện match)
+    Nếu có candidate_rules (từ embedding), chỉ xét các rule đó.
     """
+    rules_to_check = candidate_rules if candidate_rules else RULES
     matched = []
-    for rule in RULES:
+    
+    for rule in rules_to_check:
         conds = rule["conditions"]
-        # Đếm số điều kiện match
         matched_conds = 0
         
         print(f"[FC] Checking Rule {rule['id']}: conditions={conds}")
@@ -288,13 +352,12 @@ def forward_chaining(facts: Dict[str, List[str]]) -> List[Dict]:
                     if req in facts[slot]:
                         print(f"[FC]       MATCH: '{req}'")
                         matched_conds += 1
-                        break  # 1 slot chỉ tính 1 lần
+                        break
                     else:
                         print(f"[FC]       NO MATCH: '{req}' NOT in {facts[slot]}")
             else:
                 print(f"[FC]     Slot '{slot}' NOT in facts")
         
-        # Nếu có ít nhất 1 điều kiện match → coi như match
         if matched_conds > 0:
             print(f"[FC] ✓ Rule {rule['id']}: matched {matched_conds}/{len(conds)} conditions")
             matched.append(rule)
@@ -303,30 +366,30 @@ def forward_chaining(facts: Dict[str, List[str]]) -> List[Dict]:
     
     return matched
 
-# THAY TOÀN BỘ hàm find_missing_conditions() bằng cái này
-# THAY TOÀN BỘ HÀM NÀY (từ dòng ~170)
-def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dict[str, List[str]]:
+def find_missing_conditions(facts: Dict[str, List[str]], session_id: str, candidate_rules: List[Dict] = None) -> Dict[str, List[str]]:
+    """Tìm điều kiện còn thiếu từ các rule khả thi"""
+    rules_to_check = candidate_rules if candidate_rules else RULES
     missing = {}
-    candidate_rules = []
+    candidate_rules_scored = []
     
     # Tìm các rule tiềm năng (đã khớp ít nhất 1 điều kiện)
-    for rule in RULES:
+    for rule in rules_to_check:
         conds = rule["conditions"]
         satisfied = sum(1 for slot, reqs in conds.items() 
                        if slot in facts and any(r in facts[slot] for r in reqs))
         total = len(conds)
         if satisfied > 0:
-            candidate_rules.append((rule, satisfied / total))
+            candidate_rules_scored.append((rule, satisfied / total))
     
     # Sắp xếp theo độ khớp cao nhất
-    candidate_rules.sort(key=lambda x: x[1], reverse=True)
+    candidate_rules_scored.sort(key=lambda x: x[1], reverse=True)
     
-    # LẤY DANH SÁCH SLOT ĐÃ HỎI TRƯỚC ĐÓ
+    # Lấy danh sách slot đã hỏi trước đó
     asked_key = f"asked:{session_id}"
     asked_slots = set(r.smembers(asked_key))
     
-    # Chỉ hỏi những slot CHƯA hỏi
-    for rule, score in candidate_rules[:3]:  # chỉ xét 3 rule tốt nhất
+    # Chỉ hỏi những slot CHƯA hỏi từ các rule tốt nhất
+    for rule, score in candidate_rules_scored[:3]:
         for slot, reqs in rule["conditions"].items():
             # Skip nếu đã có dữ liệu cho slot này
             if slot in facts and any(r in facts[slot] for r in reqs):
@@ -335,14 +398,15 @@ def find_missing_conditions(facts: Dict[str, List[str]], session_id: str) -> Dic
             if slot in asked_slots:
                 continue
             # Thêm vào danh sách cần hỏi
-            missing.setdefault(slot, set()).update(reqs[:5])  # giới hạn 5 gợi ý
+            missing.setdefault(slot, set()).update(reqs[:5])
     
-    # LƯU LẠI NHỮNG SLOT SẮP HỎI ĐỂ LẦN SAU KHÔNG LẶP
+    # Lưu lại những slot sắp hỏi
     if missing:
         r.sadd(asked_key, *missing.keys())
         r.expire(asked_key, REDIS_TTL)
     
     return {k: list(v) for k, v in missing.items()}
+
 # ============== SMART QUESTIONS ==============
 SMART_QUESTIONS = {
     "action": {
@@ -422,17 +486,19 @@ SMART_QUESTIONS = {
 class QueryRequest(BaseModel):
     session_id: str
     message: Optional[str] = None
-    text: Optional[str] = None  # THÊM DÒNG NÀY
+    text: Optional[str] = None
     facts: Optional[Dict[str, List[str]]] = None
 
     def get_input_text(self) -> Optional[str]:
         return self.message or self.text
+
 class QueryResponse(BaseModel):
     status: str  # "result" | "need_info" | "unknown"
     message: str = None
     violations: List[Dict] = Field(default_factory=list)
     questions: List[Dict] = Field(default_factory=list)
     session_facts: Dict[str, List[str]] = Field(default_factory=dict)
+    candidate_rules_count: int = 0  # Thêm thông tin debug
 
 # ============== SESSION ==============
 def get_facts(sid: str) -> Dict[str, List[str]]:
@@ -442,41 +508,61 @@ def get_facts(sid: str) -> Dict[str, List[str]]:
 def save_facts(sid: str, facts: Dict[str, List[str]]):
     r.setex(f"session:{sid}", REDIS_TTL, json.dumps(facts))
 
-# ============== MAIN ENDPOINT ==============
+# ============== MAIN ENDPOINT VỚI EMBEDDING ==============
 @app.post("/infer", response_model=QueryResponse)
 async def infer(req: QueryRequest):
-    if req.message and any(req.message.lower().startswith(x) for x in ["tôi", "em", "mình", "tớ"]):
-        current_facts = {}  # coi như mô tả mới hoàn toàn
-        r.delete(f"asked:{req.session_id}")
     if not req.session_id:
         raise HTTPException(400, "session_id required")
-    print(f"[INFER] session={req.session_id} message={req.message} text={req.text} facts={req.facts}")
+    
+    print(f"[INFER] session={req.session_id} message={req.message} text={req.text}")
+    
     current_facts = get_facts(req.session_id)
     new_facts = {}
+    candidate_rules = []
 
+    # BƯỚC 1: EMBEDDING CÂU HỎI VÀ SO KHỚP
     input_text = req.get_input_text()
     if input_text:
+        # Extract facts bằng keyword matching
         new_facts = extract_facts_smart(input_text)
-    print(f"Extracted facts from text: {new_facts}")
+        
+        # Generate embedding cho câu hỏi
+        query_embedding = get_embedding(input_text)
+        print(f"[EMBEDDING] Generated embedding for query: {len(query_embedding)} dimensions")
+        
+        # Tìm các rule khả thi bằng embedding
+        similar_rules_info = find_similar_rules(query_embedding, threshold=0.7)
+        candidate_rules = [info["rule"] for info in similar_rules_info]
+        
+        print(f"[EMBEDDING] Found {len(candidate_rules)} candidate rules via embedding")
+        for info in similar_rules_info[:3]:  # Log top 3
+            print(f"[EMBEDDING] Rule {info['rule']['id']} - similarity: {info['similarity']:.3f}")
+
+    # Merge facts
     if req.facts:
         for k, v in req.facts.items():
             new_facts.setdefault(k, []).extend(v)
 
-    # Merge + dedup
     for k, v in new_facts.items():
         current_facts.setdefault(k, []).extend(v)
         current_facts[k] = list(set(current_facts[k]))
 
-    print(f"Current facts: {current_facts}")
     save_facts(req.session_id, current_facts)
+    
+    # Reset asked slots nếu có message mới
     if req.message:
         r.delete(f"asked:{req.session_id}")
-    # Kiểm tra có vi phạm không
-    violations = forward_chaining(current_facts)
-    for v in violations:
-        print(f"Matched rule: {v['id']} with priority {v.get('priority')}")
 
-    # Check xem rules đã đủ điều kiện chưa (ALL conditions match)
+    # BƯỚC 2: SUY DIỄN TIẾN VỚI CANDIDATE RULES
+    if candidate_rules:
+        violations = forward_chaining(current_facts, candidate_rules)
+        print(f"[FC] Found {len(violations)} violations from {len(candidate_rules)} candidate rules")
+    else:
+        # Fallback: dùng tất cả rules nếu không có candidate từ embedding
+        violations = forward_chaining(current_facts)
+        print(f"[FC] No candidate rules from embedding, using all {len(RULES)} rules")
+
+    # BƯỚC 3: KIỂM TRA RULES ĐÃ MATCH ĐẦY ĐỦ CHƯA
     fully_matched = []
     for rule in violations:
         conds = rule["conditions"]
@@ -487,22 +573,23 @@ async def infer(req: QueryRequest):
                 break
         if all_matched:
             fully_matched.append(rule)
-        print(f"[CHECK] Rule {rule['id']}: all_matched={all_matched}")
-    
-    # Nếu có rule FULLY matched → return result
+
+    # BƯỚC 4: NẾU CÓ RULES MATCH ĐẦY ĐỦ → TRẢ KẾT QUẢ
     if fully_matched:
         results = []
         for v in fully_matched:
+            penalty_info = v.get("penalty", {})
             results.append({
-                "id": v["code"] or v["id"],
+                "id": v.get("code") or v["id"],
                 "title": v.get("title", "Vi phạm giao thông"),
-                "legal_ref": v["penalty"].get("legal_ref", "Nghị định 168/2024"),
-                "penalty": f"{v['penalty']['amount']} {v['penalty']['unit']}",
-                "additional": v['penalty'].get("additional", ""),
+                "legal_ref": penalty_info.get("legal_ref", "Nghị định 168/2024"),
+                "penalty": f"{penalty_info.get('amount', '0')} {penalty_info.get('unit', 'đồng')}",
+                "additional": penalty_info.get("additional", ""),
                 "description": v.get("conclusion", "Bạn đã vi phạm luật giao thông đường bộ")
             })
-        # Also compute missing questions for other partially-matched rules
-        missing = find_missing_conditions(current_facts, req.session_id)
+
+        # Vẫn có thể hỏi thêm cho các rules khác
+        missing = find_missing_conditions(current_facts, req.session_id, candidate_rules)
         questions = []
         if missing:
             for slot in missing.keys():
@@ -521,15 +608,12 @@ async def infer(req: QueryRequest):
             message=f"Đã phát hiện {len(fully_matched)} hành vi vi phạm!",
             violations=results,
             questions=questions,
-            session_facts=current_facts
+            session_facts=current_facts,
+            candidate_rules_count=len(candidate_rules)
         )
 
-    # Nếu có partial match nhưng chưa đủ → hỏi missing conditions
-    if violations:
-        print(f"[BACKWARD] {len(violations)} rules partially matched, asking for missing conditions...")
-    
-    # Nếu chưa đủ dữ liệu → hỏi lại
-    missing = find_missing_conditions(current_facts, req.session_id)
+    # BƯỚC 5: SUY DIỄN LÙI - HỎI THÊM THÔNG TIN
+    missing = find_missing_conditions(current_facts, req.session_id, candidate_rules)
     if missing:
         questions = []
         for slot in missing.keys():
@@ -542,25 +626,28 @@ async def infer(req: QueryRequest):
                 "question": template["question"],
                 "options": template["options"]
             })
-        print(questions, current_facts)
+        
         return QueryResponse(
             status="need_info",
             message="Mình cần thêm thông tin để tư vấn chính xác!",
             questions=questions,
-            session_facts=current_facts
+            session_facts=current_facts,
+            candidate_rules_count=len(candidate_rules)
         )
 
-    # Không hiểu gì cả
+    # BƯỚC 6: KHÔNG TÌM THẤY VI PHẠM
     return QueryResponse(
         status="unknown",
         message="Mình chưa hiểu bạn vi phạm lỗi gì. Hãy kể rõ hơn nhé!\nVí dụ: 'Tôi vượt đèn đỏ bằng xe máy, không đội mũ bảo hiểm'",
-        session_facts=current_facts
+        session_facts=current_facts,
+        candidate_rules_count=len(candidate_rules)
     )
 
 # ============== UTILS ==============
 @app.post("/reset/{session_id}")
 def reset(session_id: str):
     r.delete(f"session:{session_id}")
+    r.delete(f"asked:{session_id}")
     return {"status": "reset"}
 
 @app.get("/health")
@@ -568,6 +655,16 @@ def health():
     return {
         "status": "ok",
         "rules_count": len(RULES),
+        "conditions_count": len(RULE_CONDITIONS),
         "redis": r.ping(),
-        "db": "connected" if RULES else "no rules"
+        "model_loaded": model is not None
+    }
+
+@app.get("/debug/embedding")
+def debug_embedding(text: str = "vượt đèn đỏ"):
+    embedding = get_embedding(text)
+    return {
+        "text": text,
+        "embedding_length": len(embedding),
+        "embedding_sample": embedding[:5] if embedding else None
     }
